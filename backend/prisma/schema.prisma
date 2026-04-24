@@ -1,0 +1,342 @@
+// Mandarin Master — Prisma Schema (v0.1.0)
+// 17 张表：14 张业务表 + 3 张 Auth.js 辅助表（Account/Session/VerificationToken）
+// Auth.js Prisma adapter 所需字段已内置在 User model
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =====================================================================
+// Auth.js — 必须字段（@auth/prisma-adapter 直接兼容）
+// =====================================================================
+
+model User {
+  id            String    @id @default(uuid())
+  // Auth.js 标准字段
+  name          String?                        // 显示名
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?                        // 头像 URL
+  // 自有字段
+  passwordHash  String?                        // email 注册时存 bcrypt hash
+  createdAt     DateTime  @default(now())
+  lastLoginAt   DateTime?
+
+  // Auth.js relations
+  accounts      Account[]
+  sessions      Session[]
+
+  // 业务 relations
+  studentCore         StudentCore?
+  rollingSummary      StudentRollingSummary?
+  recentLessons       StudentRecentLesson[]
+  lessons             LessonArchive[]
+  vocabLog            VocabLog[]
+  decks               UserDeck[]
+  balance             UserBalance?
+  transactions        BalanceTransaction[]
+
+  @@map("users")
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verification_tokens")
+}
+
+// =====================================================================
+// 学生档案分层（Layer 1 / 2 / 3 注入 prompt；Layer 4 仅查询）
+// 每节课注入 AI 的总 token ≈ 1400（恒定，不随使用次数增长）
+// =====================================================================
+
+// Layer 1 — 核心档案（~500 token）
+model StudentCore {
+  userId             String   @id
+  nativeLanguage     String?                // 用户母语，onboarding 时必选，NULL 表示尚未完成 onboarding
+  uiLanguage         String   @default("en")
+  hskLevelSelf       Int      @default(0)   // 用户自评 0-6（0=未评估）
+  learningGoals      String[]               // 学习目的标签：study/work/conversation/travel/culture/exam/family，可为空
+  conversationStyle  String   @default("normal") // patient/normal/fast
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("student_core")
+}
+
+// Layer 2 — 滚动摘要（每 10 节课重写，~300 token）
+model StudentRollingSummary {
+  userId          String   @id
+  summaryText     String?                    // DeepSeek 生成的 200 字总结
+  basedOnLessons  Int?                       // 基于最近多少节课
+  generatedAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("student_rolling_summary")
+}
+
+// Layer 3 — 短期记忆（最近 3 节课，每节写一条，老的滚动覆盖）
+// 应用层逻辑：每次插入后删除该用户最早的记录，只保留最近 3 条
+model StudentRecentLesson {
+  id             String   @id @default(uuid())
+  userId         String
+  lessonId       String                      // 对应 LessonArchive.id
+  classmateSług  String?
+  shortSummary   String?                     // 100-200 字
+  topics         String[]
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("student_recent_lessons")
+}
+
+// =====================================================================
+// AI 同学配置（5 位同学，每位对应一个 AI 引擎）
+// =====================================================================
+
+model Classmate {
+  id               String   @id @default(uuid())
+  slug             String   @unique               // "lin_xiaoyu"
+  nameZh           String?                        // "林小雨"
+  nameOrigin       String?                        // "Lín Xiǎoyǔ"
+  country          String?                        // "中国"
+  countryFlag      String?                        // "🇨🇳"
+  nativeLanguage   String?                        // "中文（母语）"
+  speaksLanguages  String[]                       // ["中文", "英语"]
+  backgroundStory  String?                        // 一句话背景故事
+  personalityTags  String[]                       // ["活泼", "亲和"]
+  avatarUrl        String?
+  engine           String                         // doubao/step/openai/qwen/glm
+  voiceId          String?
+  voiceDescription String?                        // "北京年轻女声"
+  price5minUsd     Decimal? @db.Decimal(5, 2)
+  price15minUsd    Decimal? @db.Decimal(5, 2)
+  price25minUsd    Decimal? @db.Decimal(5, 2)
+  isActive         Boolean  @default(true)
+  displayOrder     Int      @default(0)
+  promptTemplate   String?                        // 同学专属 prompt 模板
+  createdAt        DateTime @default(now())
+
+  lessons LessonArchive[]
+
+  @@map("classmates")
+}
+
+// =====================================================================
+// 课程历史归档（Layer 4 — 不注入 prompt，仅用户查询）
+// =====================================================================
+
+model LessonArchive {
+  id              String    @id @default(uuid())
+  userId          String
+  classmateId     String?
+  durationMinutes Int
+  status          String    @default("in_progress") // in_progress/completed/aborted
+  transcript      Json?                              // 完整对话（JSONB）
+  aiSummary       String?                            // 课后总结（DeepSeek 生成纯文本）
+  costUsd         Decimal?  @db.Decimal(8, 4)        // AI 实际成本
+  paidAmountUsd   Decimal?  @db.Decimal(5, 2)        // 用户实付金额
+  startedAt       DateTime  @default(now())
+  endedAt         DateTime?
+
+  user             User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  classmate        Classmate?         @relation(fields: [classmateId], references: [id])
+  transactions     BalanceTransaction[]
+
+  @@index([userId, startedAt(sort: Desc)])
+  @@map("lesson_archive")
+}
+
+// =====================================================================
+// 词汇接触档案（vocab_log ⊃ Word Book）
+// vocab_log = 用户接触过的所有词（被动累积，不参与 SRS 复习）
+// Word Book  = 用户主动加入的卡组（参与 Leitner SRS）
+// =====================================================================
+
+model VocabLog {
+  id                String   @id @default(uuid())
+  userId            String
+  word              String
+  pinyin            String?
+  definition        String?                         // moedict 中文释义
+  source            String?                         // search/chat/hsk_pack/manual
+  firstSeenAt       DateTime @default(now())
+  lastEncounteredAt DateTime @default(now())
+  encounterCount    Int      @default(1)
+  inWordBook        Boolean  @default(false)
+  hskLevel          Int?                            // 词的 HSK 等级（如果有）
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, word])
+  @@index([userId, lastEncounteredAt(sort: Desc)])
+  @@index([userId, inWordBook])
+  @@map("vocab_log")
+}
+
+// =====================================================================
+// Word Book（卡组系统，从前端 localStorage 迁移到云端）
+// =====================================================================
+
+model UserDeck {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  flashcards UserFlashcard[]
+
+  @@index([userId])
+  @@map("user_decks")
+}
+
+model UserFlashcard {
+  id           String    @id @default(uuid())
+  deckId       String
+  word         String?
+  traditional  String?                   // 繁体
+  pinyin       String?
+  definition   String?                   // 已废弃，保留兼容旧数据
+  pos          String?                   // 词性 category
+  context      String?                   // 来源句子
+  note         String?                   // 用户自定义备注
+  box          Int       @default(1)    // Leitner box 1-5
+  nextReview   DateTime?
+  lastReviewed DateTime?
+  reviewCount  Int       @default(0)
+  correctCount Int       @default(0)
+  addedAt      DateTime  @default(now())
+
+  deck UserDeck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  @@index([deckId])
+  @@map("user_flashcards")
+}
+
+// =====================================================================
+// HSK 词包（预设公共数据，1-6 级，约 5000 词）
+// =====================================================================
+
+model HskWord {
+  id           String  @id @default(uuid())
+  word         String
+  pinyin       String?
+  definition   String?
+  pos          String?
+  level        Int                  // 1-6
+  exampleZh    String?
+  audioUrl     String?
+  displayOrder Int?
+
+  @@unique([word, level])
+  @@index([level, displayOrder])
+  @@map("hsk_words")
+}
+
+// =====================================================================
+// 用户余额（充值制，不是订阅）
+// Stripe 一次性 Checkout，永远不创建 Subscription
+// =====================================================================
+
+model UserBalance {
+  userId         String   @id
+  balanceUsd     Decimal  @default(0) @db.Decimal(10, 2)
+  totalRecharged Decimal  @default(0) @db.Decimal(10, 2)
+  totalConsumed  Decimal  @default(0) @db.Decimal(10, 2)
+  updatedAt      DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_balance")
+}
+
+model BalanceTransaction {
+  id               String    @id @default(uuid())
+  userId           String
+  type             String                           // recharge/consume/refund/bonus
+  amountUsd        Decimal   @db.Decimal(10, 2)    // 正数=入账，负数=扣款
+  balanceAfter     Decimal   @db.Decimal(10, 2)    // 操作后余额
+  description      String?
+  relatedLessonId  String?
+  stripePaymentId  String?
+  createdAt        DateTime  @default(now())
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  relatedLesson LessonArchive? @relation(fields: [relatedLessonId], references: [id])
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("balance_transactions")
+}
+
+// =====================================================================
+// Legacy 公共表（跨用户共享，无 userId FK）
+// =====================================================================
+
+// UI 多语言翻译缓存
+model I18nCache {
+  lang String @id @db.VarChar(20)
+  data Json
+
+  @@map("i18n_cache")
+}
+
+// 全局词频统计（首页热词 chip + 词库面板）
+model WordStat {
+  word           String   @id @db.VarChar(50)
+  traditional    String?  @db.VarChar(50)
+  pinyin         String?  @db.VarChar(100)
+  category       String?  @db.VarChar(20)
+  count          Int      @default(1)
+  pinyinOverride String?  @db.VarChar(100)   // 管理员修正拼音
+  firstSeen      DateTime @default(now())
+  lastSeen       DateTime @default(now())
+
+  @@index([count(sort: Desc)])
+  @@index([category])
+  @@map("word_stats")
+}

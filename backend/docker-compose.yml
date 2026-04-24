@@ -1,0 +1,32 @@
+# Mandarin Master 本地开发环境
+# 启动: docker compose up -d
+# 停止: docker compose down
+# 查看日志: docker compose logs -f
+#
+# 端口 5433（避开 vocab_master 的 5432）
+# 容器名 mandarin-master-db
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: mandarin-master-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: mandarin_master
+    ports:
+      - "5433:5432"
+    volumes:
+      - mandarin_master_pgdata:/var/lib/postgresql/data
+      # 首次启动自动执行 schema.sql
+      - ./src/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d mandarin_master"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mandarin_master_pgdata:
+    name: mandarin_master_pgdata
